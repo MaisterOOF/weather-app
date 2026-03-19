@@ -1,15 +1,2 @@
-# Telia Weather ETL Pipeline
-#
-# This project uses only the Python standard library.
-# No external packages are required.
-#
-# Standard library modules used:
-#   urllib.request, urllib.error  — HTTP requests
-#   json                         — JSON parsing
-#   sqlite3                      — Database
-#   logging                      — Structured logging
-#   argparse                     — CLI argument parsing
-#   datetime                     — Date calculations
-#   pathlib                      — File path handling
-#   time                         — Rate-limit delays
-#   math                         — NaN checks
+requests>=2.28
+pytest>=7.0

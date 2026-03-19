@@ -15,16 +15,13 @@ import logging
 import math
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from sql_definitions import ALL_DDL, ALL_VIEW_NAMES, ALL_VIEWS
+import requests
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
+from sql_definitions import ALL_DDL, ALL_VIEWS
+
 
 RESTCOUNTRIES_URL = (
     "https://restcountries.com/v3.1/region/europe"
@@ -46,19 +43,20 @@ RATE_LIMIT_DELAY = 0.5        # Seconds between Open-Meteo requests
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "weather.db"
 DEFAULT_LOOKBACK_DAYS = 30
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
 
-# ---------------------------------------------------------------------------
-# HTTP Helpers
-# ---------------------------------------------------------------------------
+if not log.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    log.addHandler(handler)
+    log.propagate = False
 
 
-def http_get_json(url: str) -> dict | list:
+def http_get_json(url: str, params: dict | None = None) -> dict | list:
     """Perform an HTTP GET with retry and exponential back-off.
 
     Returns the parsed JSON response body.
@@ -67,10 +65,15 @@ def http_get_json(url: str) -> dict | list:
     last_error: Exception | None = None
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "TeliaWeatherETL/1.0"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+            resp = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": "TeliaWeatherETL/1.0"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
             last_error = exc
             wait = HTTP_BACKOFF_BASE * (2 ** (attempt - 1))
             log.warning("HTTP attempt %d/%d failed for %s: %s — retrying in %.1fs",
@@ -79,14 +82,9 @@ def http_get_json(url: str) -> dict | list:
     raise RuntimeError(f"Failed to fetch {url} after {HTTP_RETRIES} attempts: {last_error}")
 
 
-# ---------------------------------------------------------------------------
-# Extract
-# ---------------------------------------------------------------------------
-
-
 def extract_countries() -> list[dict]:
     """Fetch European countries from the RestCountries API."""
-    log.info("Extracting countries from RestCountries API …")
+    log.info("Extracting countries...")
     data = http_get_json(RESTCOUNTRIES_URL)
     log.info("Received %d country records.", len(data))
     return data
@@ -95,17 +93,15 @@ def extract_countries() -> list[dict]:
 def extract_weather(latitude: float, longitude: float,
                     start_date: str, end_date: str) -> dict:
     """Fetch daily weather archive for a single location from Open-Meteo."""
-    params = (
-        f"?latitude={latitude}&longitude={longitude}"
-        f"&start_date={start_date}&end_date={end_date}"
-        f"&daily={DAILY_VARIABLES}&timezone=auto"
-    )
-    return http_get_json(OPEN_METEO_BASE_URL + params)
-
-
-# ---------------------------------------------------------------------------
-# Transform
-# ---------------------------------------------------------------------------
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": DAILY_VARIABLES,
+        "timezone": "auto",
+    }
+    return http_get_json(OPEN_METEO_BASE_URL, params=params)
 
 
 def transform_countries(raw: list[dict]) -> list[dict]:
@@ -137,13 +133,11 @@ def transform_countries(raw: list[dict]) -> list[dict]:
             "area_km2":     float(entry.get("area", 0.0)),
         })
 
-    log.info("Transformed %d countries (%d skipped).",
-             len(cleaned), len(raw) - len(cleaned))
     return cleaned
 
 
-def _safe_float(value: object) -> float | None:
-    """Return *value* as a float, or ``None`` if it is missing / NaN."""
+def _parse_float_or_none(value: object) -> float | None:
+    """Return value as a float or None if it is missing / NaN."""
     if value is None:
         return None
     try:
@@ -161,26 +155,28 @@ def transform_weather(country_name: str, raw: dict) -> list[dict]:
     """
     daily = raw.get("daily", {})
     dates = daily.get("time", [])
+
+    temp_max  = daily.get("temperature_2m_max", [])
+    temp_min  = daily.get("temperature_2m_min", [])
+    precip    = daily.get("precipitation_sum", [])
+    wind      = daily.get("wind_speed_10m_max", [])
+    sunshine  = daily.get("sunshine_duration", [])
+
     rows: list[dict] = []
     for i, date_str in enumerate(dates):
-        sunshine_sec = _safe_float(daily.get("sunshine_duration", [None] * (i + 1))[i])
+        sunshine_sec = _parse_float_or_none(sunshine[i]) if i < len(sunshine) else None
         sunshine_hrs = round(sunshine_sec / 3600, 2) if sunshine_sec is not None else None
 
         rows.append({
             "country_name":       country_name,
             "date":               date_str,
-            "temperature_max_c":  _safe_float(daily.get("temperature_2m_max", [None] * (i + 1))[i]),
-            "temperature_min_c":  _safe_float(daily.get("temperature_2m_min", [None] * (i + 1))[i]),
-            "precipitation_mm":   _safe_float(daily.get("precipitation_sum", [None] * (i + 1))[i]),
-            "wind_speed_max_kmh": _safe_float(daily.get("wind_speed_10m_max", [None] * (i + 1))[i]),
+            "temperature_max_c":  _parse_float_or_none(temp_max[i]) if i < len(temp_max) else None,
+            "temperature_min_c":  _parse_float_or_none(temp_min[i]) if i < len(temp_min) else None,
+            "precipitation_mm":   _parse_float_or_none(precip[i])   if i < len(precip)   else None,
+            "wind_speed_max_kmh": _parse_float_or_none(wind[i])     if i < len(wind)     else None,
             "sunshine_hours":     sunshine_hrs,
         })
     return rows
-
-
-# ---------------------------------------------------------------------------
-# Load
-# ---------------------------------------------------------------------------
 
 
 def init_database(conn: sqlite3.Connection) -> None:
@@ -190,7 +186,8 @@ def init_database(conn: sqlite3.Connection) -> None:
 
 
 def load_raw_countries(conn: sqlite3.Connection, payload: list[dict]) -> None:
-    """Insert the full RestCountries JSON payload into the raw layer."""
+    """Replace the raw countries payload for idempotent re-runs."""
+    conn.execute("DELETE FROM raw_countries")
     conn.execute(
         "INSERT INTO raw_countries (payload) VALUES (?)",
         (json.dumps(payload, ensure_ascii=False),),
@@ -238,16 +235,13 @@ def load_clean_weather(conn: sqlite3.Connection, rows: list[dict]) -> None:
 
 def create_views(conn: sqlite3.Connection) -> None:
     """Create (or replace) analytical views."""
-    # Drop existing views first so definitions can be updated
-    for view_name in ALL_VIEW_NAMES:
-        conn.execute(f"DROP VIEW IF EXISTS {view_name}")
+    conn.executescript("""
+        DROP VIEW IF EXISTS v_avg_temperature_ranking;
+        DROP VIEW IF EXISTS v_most_rainfall;
+        DROP VIEW IF EXISTS v_30day_summary;
+    """)
     conn.executescript(ALL_VIEWS)
     log.info("Analytical views created.")
-
-
-# ---------------------------------------------------------------------------
-# Verify
-# ---------------------------------------------------------------------------
 
 
 def verify(conn: sqlite3.Connection) -> None:
@@ -256,13 +250,11 @@ def verify(conn: sqlite3.Connection) -> None:
     log.info("VERIFICATION")
     log.info("=" * 60)
 
-    # 1. Country count
     (country_count,) = conn.execute("SELECT COUNT(*) FROM countries").fetchone()
-    _check("Countries loaded", country_count > 0, f"{country_count} rows")
+    _log_verification_result("Countries loaded", country_count > 0, f"{country_count} rows")
 
-    # 2. Weather record count
     (weather_count,) = conn.execute("SELECT COUNT(*) FROM daily_weather").fetchone()
-    _check("Weather records loaded", weather_count > 0, f"{weather_count} rows")
+    _log_verification_result("Weather records loaded", weather_count > 0, f"{weather_count} rows")
 
     # 3. Every country has weather data
     orphans = conn.execute(
@@ -270,7 +262,7 @@ def verify(conn: sqlite3.Connection) -> None:
            LEFT JOIN daily_weather dw ON dw.country_name = c.country_name
            WHERE dw.country_name IS NULL"""
     ).fetchall()
-    _check("All countries have weather data", len(orphans) == 0,
+    _log_verification_result("All countries have weather data", len(orphans) == 0,
            f"{len(orphans)} countries missing weather" if orphans else "OK")
 
     # 4. Temperature sanity: max >= min
@@ -280,14 +272,14 @@ def verify(conn: sqlite3.Connection) -> None:
              AND temperature_min_c IS NOT NULL
              AND temperature_max_c < temperature_min_c"""
     ).fetchone()
-    _check("Temperature max >= min", bad_temps == 0,
+    _log_verification_result("Temperature max >= min", bad_temps == 0,
            f"{bad_temps} invalid rows" if bad_temps else "OK")
 
     # 5. Precipitation non-negative
     (neg_precip,) = conn.execute(
         "SELECT COUNT(*) FROM daily_weather WHERE precipitation_mm < 0"
     ).fetchone()
-    _check("Precipitation non-negative", neg_precip == 0,
+    _log_verification_result("Precipitation non-negative", neg_precip == 0,
            f"{neg_precip} negative rows" if neg_precip else "OK")
 
     # 6. Sunshine within 0–24 hours
@@ -296,16 +288,20 @@ def verify(conn: sqlite3.Connection) -> None:
            WHERE sunshine_hours IS NOT NULL
              AND (sunshine_hours < 0 OR sunshine_hours > 24)"""
     ).fetchone()
-    _check("Sunshine 0–24 h", bad_sun == 0,
+    _log_verification_result("Sunshine 0–24 h", bad_sun == 0,
            f"{bad_sun} out-of-range rows" if bad_sun else "OK")
 
     # 7. Raw layer preserved
     (raw_c,) = conn.execute("SELECT COUNT(*) FROM raw_countries").fetchone()
     (raw_w,) = conn.execute("SELECT COUNT(*) FROM raw_weather").fetchone()
-    _check("Raw payloads preserved", raw_c > 0 and raw_w > 0,
+    _log_verification_result("Raw payloads preserved", raw_c > 0 and raw_w > 0,
            f"raw_countries={raw_c}, raw_weather={raw_w}")
 
-    # 8. Preview warmest and wettest
+    log.info("=" * 60)
+
+
+def print_preview(conn: sqlite3.Connection) -> None:
+    """Print a preview of the top warmest and wettest capitals."""
     log.info("-" * 60)
     log.info("Top 5 warmest capitals:")
     for row in conn.execute(
@@ -319,34 +315,26 @@ def verify(conn: sqlite3.Connection) -> None:
     ):
         log.info("  %-25s  %.2f mm", row[0], row[1])
 
-    log.info("=" * 60)
+    log.info("-" * 60)
 
 
-def _check(label: str, passed: bool, detail: str) -> None:
+def _log_verification_result(label: str, passed: bool, detail: str) -> None:
     """Log a single verification check result."""
     status = "PASS" if passed else "FAIL"
     log.info("  [%s] %s — %s", status, label, detail)
 
 
-# ---------------------------------------------------------------------------
-# Pipeline Orchestrator
-# ---------------------------------------------------------------------------
-
-
 def run_pipeline(db_path: Path, lookback_days: int) -> None:
     """Execute the full ETL pipeline end-to-end."""
-    log.info("Starting Telia Weather ETL Pipeline")
-    log.info("Database: %s | Look-back: %d days", db_path, lookback_days)
+    log.info("Starting Weather ETL Pipeline")
 
     # --- Date range ---
     end_date = datetime.now().date() - timedelta(days=ARCHIVE_LAG_DAYS)
     start_date = end_date - timedelta(days=lookback_days - 1)
     log.info("Weather date range: %s → %s", start_date, end_date)
 
-    # --- Extract countries ---
+    # --- Extract and transform countries ---
     raw_countries = extract_countries()
-
-    # --- Transform countries ---
     countries = transform_countries(raw_countries)
 
     # --- Init database ---
@@ -386,19 +374,13 @@ def run_pipeline(db_path: Path, lookback_days: int) -> None:
     if all_weather_rows:
         load_clean_weather(conn, all_weather_rows)
 
-    # --- Create views ---
+    # --- Create and verify views ---
     create_views(conn)
-
-    # --- Verify ---
     verify(conn)
+    print_preview(conn)
 
     conn.close()
     log.info("Pipeline finished successfully.")
-
-
-# ---------------------------------------------------------------------------
-# CLI Entry Point
-# ---------------------------------------------------------------------------
 
 
 def main() -> None:

@@ -2,7 +2,7 @@
 Transform Function Tests
 =========================
 Unit tests for the transform layer: country parsing, weather parsing,
-and the _safe_float helper.
+and the _parse_float_or_none helper.
 
 Run:
     python -m pytest test_transforms.py -v
@@ -12,38 +12,38 @@ from __future__ import annotations
 
 import math
 
-from etl_pipeline import _safe_float, transform_countries, transform_weather
+from etl_pipeline import _parse_float_or_none, transform_countries, transform_weather
 
 
 # ---------------------------------------------------------------------------
-# _safe_float
+# _parse_float_or_none
 # ---------------------------------------------------------------------------
 
 class TestSafeFloat:
 
     def test_normal_number(self):
-        assert _safe_float(12.5) == 12.5
+        assert _parse_float_or_none(12.5) == 12.5
 
     def test_integer(self):
-        assert _safe_float(7) == 7.0
+        assert _parse_float_or_none(7) == 7.0
 
     def test_string_number(self):
-        assert _safe_float("3.14") == 3.14
+        assert _parse_float_or_none("3.14") == 3.14
 
     def test_none_returns_none(self):
-        assert _safe_float(None) is None
+        assert _parse_float_or_none(None) is None
 
     def test_nan_returns_none(self):
-        assert _safe_float(float("nan")) is None
+        assert _parse_float_or_none(float("nan")) is None
 
     def test_non_numeric_string_returns_none(self):
-        assert _safe_float("abc") is None
+        assert _parse_float_or_none("abc") is None
 
     def test_zero(self):
-        assert _safe_float(0) == 0.0
+        assert _parse_float_or_none(0) == 0.0
 
     def test_negative(self):
-        assert _safe_float(-5.5) == -5.5
+        assert _parse_float_or_none(-5.5) == -5.5
 
 
 # ---------------------------------------------------------------------------
